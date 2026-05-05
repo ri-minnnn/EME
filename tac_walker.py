@@ -1,15 +1,194 @@
-from tac import TACGenerator, Quadruple
 from semantic import flatten_expr
+class Quadruple:
+    def __init__(self, op, arg1, arg2, result):
+        self.op     = op
+        self.arg1   = arg1
+        self.arg2   = arg2
+        self.result = result
 
+    def __repr__(self):
+        def fmt(x): return str(x) if x is not None else "_"
+        return f"({fmt(self.op):<12} {fmt(self.arg1):<12} {fmt(self.arg2):<12} {fmt(self.result)})"
+
+class TACGenerator:
+    def __init__(self):
+        self.quads       = []
+        self.temp_count  = 0
+        self.label_count = 0
+        self.scope_stack = [{}]
+        self.current_function = None
+        self.array_dims  = {}   # name -> {"size": n} or {"rows": r, "cols": c}
+
+    # ── Helpers ───────────────────────────────────────────────
+    def new_temp(self):
+        self.temp_count += 1
+        return f"t{self.temp_count}"
+
+    def new_label(self):
+        self.label_count += 1
+        return f"L{self.label_count}"
+
+    def emit(self, op, arg1=None, arg2=None, result=None):
+        q = Quadruple(op, arg1, arg2, result)
+        self.quads.append(q)
+        return result
+
+    def emit_label(self, label):
+        self.quads.append(Quadruple("LABEL", label, None, None))
+
+    # ── Print table ───────────────────────────────────────────
+    def print_quads(self):
+        print(f"\n{'#':<5} {'OP':<12} {'ARG1':<12} {'ARG2':<12} {'RESULT'}")
+        print("─" * 55)
+        for i, q in enumerate(self.quads):
+            def fmt(x): return str(x) if x is not None else "_"
+            print(f"{i:<5} {fmt(q.op):<12} {fmt(q.arg1):<12} {fmt(q.arg2):<12} {fmt(q.result)}")
+        print("─" * 55)
+        print("TERMINAL")
+        print("TAC generation successful.")
+
+    def gen_expr(self, tokens):
+        if not tokens:
+            return None
+        tokens = [t for t in tokens if t not in (";",)]
+        if not tokens:
+            return None
+
+        # ── Single token ──
+        if len(tokens) == 1:
+            return tokens[0]
+
+        # ── Unary NOT ──
+        if tokens[0] == "!" and len(tokens) >= 2:
+            operand = self.gen_expr(tokens[1:])
+            t = self.new_temp()
+            self.emit("!", operand, None, t)
+            return t
+
+        # ── Strip outer parentheses ──
+        if tokens[0] == "(" and tokens[-1] == ")":
+            depth = 0
+            matched = True
+            for i, tok in enumerate(tokens):
+                if tok in ("(", "["): depth += 1
+                elif tok in (")", "]"): depth -= 1
+                if depth == 0 and i < len(tokens) - 1:
+                    matched = False
+                    break
+            if matched:
+                return self.gen_expr(tokens[1:-1])
+
+        # ── Array index read:  name[idx]  or  name[row][col] ──
+        if "[" in tokens and tokens[-1] == "]" and tokens.index("[") > 0:
+            bracket_open = tokens.index("[")
+            _BIN_OPS = {"||", "&&", "==", "!=", "<=", ">=", "<", ">",
+                        "+", "-", "*", "/", "//", "%", "^"}
+            _pfx_depth, _pfx_has_op = 0, False
+            for _tok in tokens[:bracket_open]:
+                if _tok in ("(", "["): _pfx_depth += 1
+                elif _tok in (")", "]"): _pfx_depth -= 1
+                elif _pfx_depth == 0 and _tok in _BIN_OPS:
+                    _pfx_has_op = True
+                    break
+            if not _pfx_has_op:
+                close_idx = tokens.index("]", bracket_open)
+            if not _pfx_has_op and bracket_open > 0:
+                arr_name = self.gen_expr(tokens[:bracket_open])
+                # ── 2D: name[row][col] ──
+                if close_idx < len(tokens) - 1 and tokens[close_idx + 1] == "[":
+                    row_val = self.gen_expr(tokens[bracket_open + 1:close_idx])
+                    b2 = close_idx + 1
+                    close_idx2 = tokens.index("]", b2 + 1)
+                    if close_idx2 == len(tokens) - 1: 
+                        col_val    = self.gen_expr(tokens[b2 + 1:close_idx2])
+                        total_cols = str(self.array_dims.get(arr_name, {}).get("cols", 1))
+                        t1 = self.new_temp(); self.emit("*", row_val, total_cols, t1)
+                        t2 = self.new_temp(); self.emit("+", t1, col_val, t2)
+                        t3 = self.new_temp(); self.emit("*", t2, "4", t3)
+                        t  = self.new_temp(); self.emit("=[]", arr_name, t3, t)
+                        return t
+                # ── 1D: name[index] ──
+                elif close_idx == len(tokens) - 1:
+                    index_val = self.gen_expr(tokens[bracket_open + 1:close_idx])
+                    t_off = self.new_temp(); self.emit("*", index_val, "4", t_off)
+                    t     = self.new_temp(); self.emit("=[]", arr_name, t_off, t)
+                    return t
+
+        # ── Binary operators (lowest to highest precedence) ──
+        for op_group in ( 
+            ["||"],
+            ["&&"],
+            ["==", "!=", "<=", ">=", "<", ">"],
+            ["+", "-"],
+            ["*", "/", "//", "%"],
+            ["^"],
+        ):
+            idx = self._find_op(tokens, op_group)
+            if idx is not None:
+                left  = self.gen_expr(tokens[:idx])
+                right = self.gen_expr(tokens[idx+1:])
+                t = self.new_temp()
+                self.emit(tokens[idx], left, right, t)
+                return t
+        # ── Unary prefix ++/-- ──
+        if tokens[0] in ("++", "--") and len(tokens) == 2:
+            var = tokens[1]
+            op  = "+" if tokens[0] == "++" else "-"
+            t   = self.new_temp()
+            self.emit(op, var, "1", t)
+            self.emit("=", t, None, var)
+            return var
+        # ── Postfix ++/-- ──
+        if tokens[-1] in ("++", "--") and len(tokens) == 2:
+            var = tokens[0]
+            op  = "+" if tokens[-1] == "++" else "-"
+            t   = self.new_temp()
+            self.emit(op, var, "1", t)
+            self.emit("=", t, None, var)
+            return t
+        # ── echo function call ──
+        if tokens[0] == "echo":
+            if len(tokens) >= 4 and "(" in tokens:
+                return self._gen_echo_call(tokens)
+
+    def _find_op(self, tokens, ops):
+        depth = 0
+        result_idx = None
+        for i, tok in enumerate(tokens):
+            if tok in ("(", "["): depth += 1
+            elif tok in (")", "]"): depth -= 1
+            elif depth == 0 and tok in ops:
+                result_idx = i
+        return result_idx
+
+    def _gen_echo_call(self, tokens):
+        func_name = tokens[1]
+        paren_start = tokens.index("(")
+        arg_tokens = tokens[paren_start+1:-1]
+        args, cur, depth = [], [], 0
+        for tok in arg_tokens:
+            if tok == "(": depth += 1; cur.append(tok)
+            elif tok == ")": depth -= 1; cur.append(tok)
+            elif tok == "," and depth == 0:
+                if cur: args.append(cur); cur = []
+            else:
+                cur.append(tok)
+        if cur: args.append(cur)
+        for arg in args:
+            val = self.gen_expr(arg)
+            self.emit("PARAM", val, None, None)
+        t = self.new_temp()
+        self.emit("CALL", func_name, str(len(args)), t)
+        return t
 
 class TACWalker:
-
     def __init__(self):
-        self.gen          = TACGenerator()   # quadruple emitter
-        self.scope_stack  = [{}]             # mirrors semantic scope
-        self.func_table   = {}               # function name → return type
-        self.loop_stack   = []               # track nested loops for break/continue
-        self.var_types    = {}               # var_name → declared dtype (for type conversion)
+        self.gen          = TACGenerator()   
+        self.scope_stack  = [{}]             
+        self.func_table   = {}               
+        self.loop_stack   = []              
+        self.var_types    = {}               
+        self.array_dims   = self.gen.array_dims 
 
     def emit(self, op, arg1=None, arg2=None, result=None):
         return self.gen.emit(op, arg1, arg2, result)
@@ -30,15 +209,13 @@ class TACWalker:
         if len(self.scope_stack) > 1:
             self.scope_stack.pop()
 
-    def set_var(self, name, value=None):
+    def set_var(self, name, value=None): 
         self.scope_stack[-1][name] = value
 
     def gen_expr(self, node):
-        tokens = [t for t in flatten_expr(node) if t not in (";",)]
-        return self.gen.gen_expr(tokens)
+        return self.gen_expr(flatten_expr(node))
 
     def gen_expr_tokens(self, tokens):
-        tokens = [t for t in tokens if t not in (";",)]
         return self.gen.gen_expr(tokens)
 
     def walk(self, node):
@@ -83,10 +260,27 @@ class TACWalker:
         dec   = decl.get("dec", {}) or {}
         size_token = dec.get("size")
         if size_token is not None:
-            self.emit("ARRAY_DECL", name, str(size_token), dtype)
-            elements = self._extract_elements(dec.get("arOpt") or {})
-            for i, elem in enumerate(elements):
-                self.emit("[]=", name, str(i), str(elem))
+            ar_opt = dec.get("arOpt") or {}
+            size2  = ar_opt.get("size2")
+            if size2 is not None:
+                # ── 2D array ──
+                rows, cols = int(size_token), int(size2)
+                self.array_dims[name] = {"rows": rows, "cols": cols}
+                self.emit("ARRAY_DECL", name, str(rows * cols), dtype)
+                two_d = ar_opt.get("2dArray") or {}
+                flat  = [str(lit) for row in two_d.get("rows", [])
+                         for lit in row.get("literals", []) if lit is not None]
+                for i, elem in enumerate(flat):
+                    t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
+                    self.emit("[]=", name, t_off, elem)
+            else:
+                # ── 1D array ──
+                self.array_dims[name] = {"size": int(size_token)}
+                self.emit("ARRAY_DECL", name, str(size_token), dtype)
+                elements = self._extract_elements(ar_opt)
+                for i, elem in enumerate(elements):
+                    t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
+                    self.emit("[]=", name, t_off, str(elem))
             self.set_var(name)
             return
         self.set_var(name)
@@ -130,7 +324,8 @@ class TACWalker:
         closure = func.get("closureCon")
         if closure:
             tokens = [t for t in flatten_expr(closure) if t != ";"]
-            self.emit("closure", tokens[0] if tokens else None, None, None)
+            ret_val = self.gen_expr_tokens(tokens) if tokens else None
+            self.emit("closure", ret_val, None, None)
         self.pop_scope()
         self.emit("FUNC_END", name, None, None)
 
@@ -139,7 +334,8 @@ class TACWalker:
             self.emit("closure", None, None, None)
             return
         tokens = [t for t in flatten_expr(node) if t != ";"]
-        self.emit("closure", tokens[0] if tokens else None, None, None)
+        ret_val = self.gen_expr_tokens(tokens) if tokens else None
+        self.emit("closure", ret_val, None, None)
 
     def walk_stmt(self, node):
         for stmt in node.get("stmts", []):
@@ -158,15 +354,31 @@ class TACWalker:
             ele_index = node.get("eleIndex") or {}
             idx       = ele_index.get("index") if isinstance(ele_index, dict) else None
             if idx is not None:
+                idx2_node = ele_index.get("index2") or {}
+                idx2      = idx2_node.get("index") if isinstance(idx2_node, dict) else None
                 t = self.new_temp()
                 self.emit("READ", None, None, t)
-                self.emit("[]=", var_name, str(idx), t)
+                if idx2 is not None:
+                    # 2D READ: arr[row][col] = input
+                    dims  = self.array_dims.get(var_name, {})
+                    tcols = str(dims.get("cols", 1))
+                    t1 = self.new_temp(); self.emit("*", str(idx), tcols, t1)
+                    t2 = self.new_temp(); self.emit("+", t1, str(idx2), t2)
+                    t3 = self.new_temp(); self.emit("*", t2, "4", t3)
+                    self.emit("[]=", var_name, t3, t)
+                else:
+                    # 1D READ: arr[index] = input  (index * 4)
+                    t_off = self.new_temp(); self.emit("*", str(idx), "4", t_off)
+                    self.emit("[]=", var_name, t_off, t)
             else:
                 self.emit("READ", None, None, var_name)
         elif kind == "spill":
             self._walk_spill(node)
         elif kind == "echo":
-            self._walk_echo_call(node.get("name", ""), node.get("echOp"))
+            fname = node.get("name", "")
+            t = self._walk_echo_call(fname, node.get("echOp"))
+            if self.func_table.get(fname) != "void":
+                self.emit("SPILL", t, None, None)
         elif kind == "desire":
             self._walk_desire(node)
         elif kind == "while":
@@ -184,10 +396,27 @@ class TACWalker:
         str_tail = node.get("strTail", {}) or {}
         size_token = loc_dec.get("index")
         if size_token is not None:
-            self.emit("ARRAY_DECL", name, str(size_token), dtype)
-            elements = self._extract_elements(loc_dec.get("arOpt") or {})
-            for i, elem in enumerate(elements):
-                self.emit("[]=", name, str(i), str(elem))
+            ar_opt = loc_dec.get("arOpt") or {}
+            size2  = ar_opt.get("size2")
+            if size2 is not None:
+                # ── 2D array ──
+                rows, cols = int(size_token), int(size2)
+                self.array_dims[name] = {"rows": rows, "cols": cols}
+                self.emit("ARRAY_DECL", name, str(rows * cols), dtype)
+                two_d = ar_opt.get("2dArray") or {}
+                flat  = [str(lit) for row in two_d.get("rows", [])
+                         for lit in row.get("literals", []) if lit is not None]
+                for i, elem in enumerate(flat):
+                    t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
+                    self.emit("[]=", name, t_off, elem)
+            else:
+                # ── 1D array ──
+                self.array_dims[name] = {"size": int(size_token)}
+                self.emit("ARRAY_DECL", name, str(size_token), dtype)
+                elements = self._extract_elements(ar_opt)
+                for i, elem in enumerate(elements):
+                    t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
+                    self.emit("[]=", name, t_off, str(elem))
             self.set_var(name)
             return
         if kind == "str" and str_tail.get("index") is not None:
@@ -225,10 +454,27 @@ class TACWalker:
         fix_loc_dec = lf.get("fixLocDec") or {}
         size_token  = node.get("size") or lf.get("size") or fix_loc_dec.get("index")
         if size_token is not None:
-            self.emit("ARRAY_DECL", name, str(size_token), dtype)
-            elements = self._extract_elements(fix_loc_dec.get("fArray") or fix_loc_dec)
-            for i, elem in enumerate(elements):
-                self.emit("[]=", name, str(i), str(elem))
+            f_array = fix_loc_dec.get("fArray") or fix_loc_dec
+            size2   = f_array.get("size2") if isinstance(f_array, dict) else None
+            if size2 is not None:
+                # ── 2D fixed array ──
+                rows, cols = int(size_token), int(size2)
+                self.array_dims[name] = {"rows": rows, "cols": cols}
+                self.emit("ARRAY_DECL", name, str(rows * cols), dtype)
+                two_d = f_array.get("2dArray") or {}
+                flat  = [str(lit) for row in two_d.get("rows", [])
+                         for lit in row.get("literals", []) if lit is not None]
+                for i, elem in enumerate(flat):
+                    t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
+                    self.emit("[]=", name, t_off, elem)
+            else:
+                # ── 1D fixed array ──
+                self.array_dims[name] = {"size": int(size_token)}
+                self.emit("ARRAY_DECL", name, str(size_token), dtype)
+                elements = self._extract_elements(f_array)
+                for i, elem in enumerate(elements):
+                    t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
+                    self.emit("[]=", name, t_off, str(elem))
             self.set_var(name)
             return
         self.set_var(name)
@@ -250,18 +496,35 @@ class TACWalker:
             self._walk_echo_call(var, idExpr.get("echOp"))
             return
 
-        # ── Array element statement: A[i] = ..., A[i]++, A[i]-- ─────────
+        # ── Array element statement: A[i]=…, A[i][j]=…, A[i]++, A[i][j]++ ─
         if id_type == "idExpr" and idExpr.get("index") is not None:
-            index = self.gen_expr_tokens(flatten_expr(idExpr.get("index")))
+            row_val = self.gen_expr_tokens(flatten_expr(idExpr.get("index")))
+
+            # Check for 2D: A[row][col]
+            idx2_node = idExpr.get("index2") or {}
+            idx2      = idx2_node.get("index") if isinstance(idx2_node, dict) else None
+
             arr_id_tail = idExpr.get("arrIDTail") or {}
 
-            # Check for A[i]++ or A[i]-- first
+            if idx2 is not None:
+                # ── Compute 2D offset: (row * total_cols + col) * 4 ──
+                col_val = str(idx2)
+                dims    = self.array_dims.get(var, {})
+                tcols   = str(dims.get("cols", 1))
+                t1 = self.new_temp(); self.emit("*", row_val, tcols, t1)
+                t2 = self.new_temp(); self.emit("+", t1, col_val, t2)
+                t_offset = self.new_temp(); self.emit("*", t2, "4", t_offset)
+            else:
+                # ── Compute 1D offset: index * 4 ──
+                t_offset = self.new_temp(); self.emit("*", row_val, "4", t_offset)
+
+            # Check for A[i]++ / A[i][j]++
             arr_tail_op = arr_id_tail.get("op", "")
             if arr_tail_op in ("++", "--"):
-                self._walk_inc_dec(arr_tail_op, var, index)
+                self._walk_inc_dec(arr_tail_op, var, t_offset)
                 return
 
-            # Otherwise it's an assignment: A[i] = expr
+            # Otherwise assignment: A[i] = expr  or  A[i][j] = expr
             ass_val  = arr_id_tail.get("assVal") or {}
             rhs_node = None
             if ass_val.get("kind") == "STRLIT":
@@ -286,7 +549,7 @@ class TACWalker:
                 val = self.gen_expr_tokens(rhs_tokens) if rhs_tokens else None
 
             if val is not None:
-                self.emit("[]=", var, index, val)
+                self.emit("[]=", var, t_offset, val)
             return
 
         # ── Plain postfix ++/-- on variable: x++ x-- ────────────────────
@@ -305,11 +568,12 @@ class TACWalker:
             return
 
         # Compound assignment: x += expr, x -= expr, etc.
-        if op in ("+=", "-=", "*=", "/=", "//=", "%=", "^="):
+        _COMP_OP = {"+=": "+", "-=": "-", "*=": "*", "/=": "/", "//=": "//", "%=": "%", "^=": "^"}
+        if op in _COMP_OP:
             rhs_node = idExpr.get("exprDec")
             if rhs_node:
                 t = self.new_temp()
-                self.emit(op[0], var, self.gen_expr(rhs_node), t)
+                self.emit(_COMP_OP[op], var, self.gen_expr(rhs_node), t)
                 self.emit("=", t, None, var)
             return
 
@@ -350,13 +614,25 @@ class TACWalker:
             elif kind == "ID":
                 name = arg.get("name")
                 if name:
-                    # Check for array subscript: spill(A[i])
-                    # The parser stores the index inside unaOp.index
+                    # Check for array subscript: spill(A[i]) or spill(A[i][j])
                     una_op = arg.get("unaOp") or {}
                     index  = una_op.get("index")
                     if index is not None:
-                        t = self.new_temp()
-                        self.emit("=[]", name, str(index), t)
+                        # Check for 2D via eleIndex inside unaOp
+                        ele_idx  = una_op.get("eleIndex") or {}
+                        index2   = ele_idx.get("index") if isinstance(ele_idx, dict) else None
+                        if index2 is not None:
+                            # 2D: spill(A[row][col])
+                            dims  = self.array_dims.get(name, {})
+                            tcols = str(dims.get("cols", 1))
+                            t1 = self.new_temp(); self.emit("*", str(index), tcols, t1)
+                            t2 = self.new_temp(); self.emit("+", t1, str(index2), t2)
+                            t3 = self.new_temp(); self.emit("*", t2, "4", t3)
+                            t  = self.new_temp(); self.emit("=[]", name, t3, t)
+                        else:
+                            # 1D: spill(A[i])  → offset = i * 4
+                            t_off = self.new_temp(); self.emit("*", str(index), "4", t_off)
+                            t     = self.new_temp(); self.emit("=[]", name, t_off, t)
                         self.emit("SPILL", t, None, None)
                     else:
                         # Plain variable: spill(x)
@@ -394,8 +670,8 @@ class TACWalker:
         if node.get("stmtOpTail"):
             self.walk(node["stmtOpTail"])
         self.pop_scope()
-        hope_tail   = node.get("hopeTail", {}) or {}
-        despair_opt = hope_tail.get("despairOpt")
+        hope_tail   = node.get("hopeTail") or node.get("hopeTailLoop") or {}
+        despair_opt = hope_tail.get("despairOpt") or hope_tail.get("despairOptLoop")
         if despair_opt:
             self.emit("GOTO", None, None, end_lbl)
             self.emit_label(else_lbl)
@@ -419,8 +695,8 @@ class TACWalker:
         if node.get("stmtOpTail"):
             self.walk(node["stmtOpTail"])
         self.pop_scope()
-        inner_tail    = node.get("hopeTail", {}) or {}
-        inner_despair = inner_tail.get("despairOpt")
+        inner_tail    = node.get("hopeTail") or node.get("hopeTailLoop") or {}
+        inner_despair = inner_tail.get("despairOpt") or inner_tail.get("despairOptLoop")
         if node.get("condition"):
             if inner_despair:
                 self.emit("GOTO", None, None, inner_end)
@@ -433,13 +709,13 @@ class TACWalker:
             self._walk_despair_opt(inner_despair)
 
     def walk_hopeTail(self, node):
-        despair_opt = node.get("despairOpt")
+        despair_opt = node.get("despairOpt") or node.get("despairOptLoop")
         if despair_opt:
             self._walk_despair_opt(despair_opt)
 
     def walk_core(self, node):
         tokens  = [t for t in flatten_expr(node.get("condition") or {}) if t != ";"]
-        var     = tokens[0] if tokens else "__core_var__"
+        var     = self.gen_expr_tokens(tokens) if tokens else "__core_var__"
         end_lbl = self.new_label()
         self.emit("CORE_BEGIN", var, None, None)
         body = node.get("body", {}) or {}
@@ -492,6 +768,10 @@ class TACWalker:
 
         if loop_var_name:
             self.set_var(loop_var_name)
+            if din_kind == "decl":
+                loop_dtype = din.get("dtype", "int")
+                self.var_types[loop_var_name] = loop_dtype
+                self.emit("DECLARE", loop_var_name, loop_dtype, None)
             if init_node:
                 self.emit("=", self.gen_expr(init_node), None, loop_var_name)
 
@@ -532,11 +812,11 @@ class TACWalker:
             self.emit("+" if tokens[0] == "++" else "-", tokens[1], "1", t)
             self.emit("=", t, None, tokens[1])
             return
-        comp_ops = {"+=", "-=", "*=", "/=", "//=", "%=", "^="}
+        _COMP_OP = {"+=": "+", "-=": "-", "*=": "*", "/=": "/", "//=": "//", "%=": "%", "^=": "^"}
         for i, tok in enumerate(tokens):
-            if tok in comp_ops and i > 0:
+            if tok in _COMP_OP and i > 0:
                 t = self.new_temp()
-                self.emit(tok[0], tokens[i-1], self.gen_expr_tokens(tokens[i+1:]), t)
+                self.emit(_COMP_OP[tok], tokens[i-1], self.gen_expr_tokens(tokens[i+1:]), t)
                 self.emit("=", t, None, tokens[i-1])
                 return
         self.gen_expr_tokens(tokens)
@@ -568,9 +848,12 @@ class TACWalker:
         if node.get("loopStmt"):
             self.walk(node["loopStmt"])
         self.emit_label(continue_lbl)
+        # pop_scope BEFORE the condition check so the scope is balanced on
+        # every path — both the back-edge (IF_TRUE jumps to start_lbl which
+        # immediately does push_scope again) and the fall-through exit path.
+        self.pop_scope()
         cond_tokens = [t for t in flatten_expr(node.get("condition")) if t != ";"]
         self.emit("IF_TRUE", self.gen_expr_tokens(cond_tokens), None, start_lbl)
-        self.pop_scope()
         self.emit_label(end_lbl)
         self.loop_stack.pop()
 
@@ -632,7 +915,6 @@ class TACWalker:
 
     def print_quads(self):
         self.gen.print_quads()
-
 
 def generate_tac(parse_tree, terminal=None):
     walker = TACWalker()

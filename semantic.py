@@ -35,6 +35,8 @@ _LEXER_TO_SEMANTIC_TYPE = {
 
 
 def resolve_type(token, scope_stack, token_type_map=None):
+    # First check if the token is a literal with a known type from the lexer
+    #determines the datatype of a token by checking the token type map and applying rules for literals and identifiers
     tmap = token_type_map if token_type_map is not None else _token_type_map
     if tmap and token in tmap:
         ltype = tmap[token]
@@ -61,6 +63,7 @@ def resolve_type(token, scope_stack, token_type_map=None):
 
 
 def lookup(var, scope_stack):
+    # Look up a variable in the scope stack, starting from the innermost scope.
     for scope in reversed(scope_stack):
         if var in scope:
             return scope[var]
@@ -640,6 +643,10 @@ def validate_expression_and_operators(tokens, scope_stack, terminal, line_no,
                 # division-by-zero check — array element access is handled above.
                 if "elements" in entry:
                     continue
+                # Skip check if the variable is known to be modified at runtime
+                # (assigned inside a desire/hope block) — let the interpreter handle it.
+                if entry.get("modified_in_loop"):
+                    continue
                 if "value" in entry and entry.get("value") is not None:
                     try:
                         clean = str(entry["value"]).replace("_", "")
@@ -1031,8 +1038,68 @@ def flatten_expr(node):
         tokens.extend(flatten_expr(node.get("value")))
 
     elif t == "coreCon":
-        tokens.extend(flatten_expr(node.get("value")))
-        tokens.extend(flatten_expr(node.get("coreVal")))
+        tokens.extend(flatten_expr(node.get("coreAdd")))
+
+    elif t == "coreAdd":
+        tokens.extend(flatten_expr(node.get("left")))
+        tokens.extend(flatten_expr(node.get("tail")))
+
+    elif t == "coreAddTail":
+        if node.get("op"):
+            tokens.append(node["op"])
+            tokens.extend(flatten_expr(node.get("right")))
+            tokens.extend(flatten_expr(node.get("tail")))
+
+    elif t == "coreMul":
+        tokens.extend(flatten_expr(node.get("left")))
+        tokens.extend(flatten_expr(node.get("tail")))
+
+    elif t == "coreMulTail":
+        if node.get("op"):
+            tokens.append(node["op"])
+            tokens.extend(flatten_expr(node.get("right")))
+            tokens.extend(flatten_expr(node.get("tail")))
+
+    elif t == "coreExp":
+        tokens.extend(flatten_expr(node.get("left")))
+        tokens.extend(flatten_expr(node.get("tail")))
+
+    elif t == "coreExpTail":
+        if node.get("op"):
+            tokens.append(node["op"])
+            tokens.extend(flatten_expr(node.get("right")))
+            tokens.extend(flatten_expr(node.get("tail")))
+
+    elif t == "coreUnary":
+        kind = node.get("kind")
+        if kind in ("++", "--"):
+            tokens.append(kind)
+            tokens.append(node.get("name", ""))
+            tokens.extend(flatten_expr(node.get("eleIndex")))
+        else:
+            tokens.extend(flatten_expr(node.get("primary")))
+
+    elif t == "corePrimary":
+        kind = node.get("kind")
+        if kind == "echo":
+            tokens.append("echo")
+            tokens.append(node.get("name", ""))
+            tokens.append("(")
+            tokens.extend(flatten_expr(node.get("echOp")))
+            tokens.append(")")
+        elif kind == "grouped":
+            tokens.append("(")
+            tokens.extend(flatten_expr(node.get("inner")))
+            tokens.append(")")
+        elif kind == "ID":
+            tokens.append(node.get("name", ""))
+            tokens.extend(flatten_expr(node.get("postfix")))
+        elif kind in ("INTLIT", "CHARLIT"):
+            tokens.append(node.get("value", ""))
+        else:
+            v = node.get("value") or node.get("name", "")
+            if v:
+                tokens.append(str(v))
 
     elif t == "locDecOp":
         tokens.extend(flatten_expr(node.get("value")))
@@ -2394,7 +2461,12 @@ class SemanticVisitor:
                         if not allowed:
                             self.err(f"Closure type mismatch - expected '{expected}', got '{value_type}'", line)
                     else:
-                        if value_type != expected:
+                        # Allow implicit char <-> int conversion per General Rule §15.a
+                        char_int_allowed = (
+                            (value_type == "char" and expected == "int") or
+                            (value_type == "int"  and expected == "char")
+                        )
+                        if value_type != expected and not char_int_allowed:
                             self.err(f"Closure type mismatch - expected '{expected}', got '{value_type}'", line)
 
 
@@ -3062,19 +3134,24 @@ class SemanticVisitor:
 
         # division by zero check for compound /=, //=, %=
         if op in ("/=", "//=", "%=") and rhs_node:
-            rhs_toks = flatten_expr(rhs_node)
-            _, is_zero = evaluate_expression(rhs_toks, self.scope_stack)
-            if is_zero:
-                self.err("Division by zero", line)
-                return
-            
-            # Uninitialized numeric variable defaults to 0 — also division by zero
-            if len(rhs_toks) == 1 and rhs_toks[0].isidentifier():
-                rhs_entry = lookup(rhs_toks[0], self.scope_stack)
-                if rhs_entry and rhs_entry.get("type") in ("int", "float", "char"):
-                    if "value" not in rhs_entry or rhs_entry.get("value") is None:
-                        self.err("Division by zero", line)
-                        return
+            inside_loop_or_cond = any(
+                ctx in ("desire", "while", "do-while", "hope", "despair")
+                for ctx in self.block_context_stack
+            )
+            if not inside_loop_or_cond:
+                rhs_toks = flatten_expr(rhs_node)
+                _, is_zero = evaluate_expression(rhs_toks, self.scope_stack)
+                if is_zero:
+                    self.err("Division by zero", line)
+                    return
+
+                # Uninitialized numeric variable defaults to 0 — also division by zero
+                if len(rhs_toks) == 1 and rhs_toks[0].isidentifier():
+                    rhs_entry = lookup(rhs_toks[0], self.scope_stack)
+                    if rhs_entry and rhs_entry.get("type") in ("int", "float", "char"):
+                        if "value" not in rhs_entry or rhs_entry.get("value") is None:
+                            self.err("Division by zero", line)
+                            return
 
         if rhs_node:
             rhs_toks = flatten_expr(rhs_node)
@@ -3171,6 +3248,10 @@ class SemanticVisitor:
         # Mark variable as initialized after successful assignment
         if op in ("=", "+=", "-=", "*=", "/=", "//=", "%=", "^="):
             self.mark_initialized(var)
+            # Mark variable as runtime-modified if assigned inside a desire/hope block
+            if entry and any(ctx in ("desire", "while", "do-while", "hope", "despair")
+                             for ctx in self.block_context_stack):
+                entry["modified_in_loop"] = True
 
     def _check_inc_dec(self, op, var, line):
         reserved = {
@@ -3985,6 +4066,9 @@ class SemanticVisitor:
 # ------------------  visit loopStmt / coreStmt visitors ---------------------------                                     
    
     def visit_loopStmt(self, node):
+        if node.get("return") is not None:
+            self._handle_closure(node.get("return"), node.get("line", 0))
+            return
         for stmt in node.get("stmts", []):
             self.visit(stmt)
         if node.get("over"):
@@ -4066,4 +4150,4 @@ def perform_semantic_analysis(tokens, terminal, parse_tree=None):
         "no_errors":      no_errors,
     }
 
-    return no_errors, semantic_data                 # <-- changed
+    return no_errors, semantic_data                 

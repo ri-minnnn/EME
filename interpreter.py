@@ -2,6 +2,8 @@ import tkinter as tk
 
 
 class TACInterpreter:
+    _MAX_STEPS = 5000   # quads executed per slice before yielding to the UI
+
     def __init__(self, quads, console_output):
         self.quads = quads
         self.console = console_output
@@ -31,6 +33,16 @@ class TACInterpreter:
         self.input_buffer = ""   # tracks what user typed
         self.last_return_value = None
 
+        # Identify global variables: those declared/initialized before the first
+        # FUNC_BEGIN quad.  These are the only variables that should be visible
+        # across function-call boundaries (shared state for recursion correctness).
+        self.global_vars = set()
+        for q in self.quads:
+            if q.op == "FUNC_BEGIN":
+                break
+            if q.op in ("DECLARE", "ARRAY_DECL") and q.arg1:
+                self.global_vars.add(q.arg1)
+
         # Pre-scan DECLARE quads to populate var_types
         for q in self.quads:
             if q.op == "DECLARE":
@@ -51,6 +63,19 @@ class TACInterpreter:
             self._console_set_editable(False)
             return
 
+        # Execute all global initialization quads before the first FUNC_BEGIN.
+        # This ensures global fixed declarations like  fixed float PI = 3.14;
+        # are properly stored as real Python numbers before brain() runs.
+        for i, q in enumerate(self.quads):
+            if q.op == "FUNC_BEGIN":
+                break
+            try:
+                self._execute(q)
+            except Exception as e:
+                self._console_write(f"\nRuntime Error (global init): {e}\n", "#ff6b6b")
+                self._console_set_editable(False)
+                return
+
         self.pc = brain_pc + 1   # skip FUNC_BEGIN itself
         self.running = True
         self._run()
@@ -59,10 +84,23 @@ class TACInterpreter:
     #  MAIN EXECUTION LOOP                                                 #
     # ------------------------------------------------------------------ #
     def _run(self):
-        """Execute quads until READ, FUNC_END of brain, or end of quads."""
+        """Execute quads until READ, FUNC_END of brain, or end of quads.
+
+        Execution is sliced into batches of _MAX_STEPS quads.  After each
+        batch control returns to the tkinter event loop (via after(0, ...))
+        so the UI stays responsive even when the program has an infinite loop.
+        """
+        steps = 0
         while self.running and self.pc < len(self.quads):
+            # Yield to the UI after every _MAX_STEPS quads so the window
+            # never freezes — this is the fix for infinite-loop hangs.
+            if steps >= self._MAX_STEPS:
+                self.console.after(0, self._run)
+                return
+            steps += 1
+
             q = self.quads[self.pc]
-           
+
             if q.op == "FUNC_END" and len(self.call_stack) == 0:
                 # returned from brain — we're done
                 self.running = False
@@ -70,7 +108,9 @@ class TACInterpreter:
 
             try:
                 self._execute(q)
-            except RuntimeError as e:
+            except Exception as e:
+                # Catch ALL Python exceptions (ZeroDivisionError, TypeError,
+                # OverflowError, etc.) so nothing crashes silently.
                 self._console_write(f"\nRuntime Error: {e}\n", "#ff6b6b")
                 self.running = False
                 self._console_set_editable(False)
@@ -112,14 +152,16 @@ class TACInterpreter:
             }
             default_val = defaults.get(dtype, 0)
             # Initialize all elements to the default value
-            if arr_name not in self.memory:
-                self.memory[arr_name] = [default_val] * size
+            self.memory[arr_name] = [default_val] * size
             self.pc += 1
 
         # ---- assignment ------------------------------------------------
         elif op == "=":
             if arg1 is None:
+                # Consume the one-shot return buffer and clear it so it
+                # cannot be reused by a subsequent assignment.
                 val = self.last_return_value
+                self.last_return_value = None
             else:
                 val = self._val(arg1)
             # Apply implicit type conversion based on target variable's declared type
@@ -130,7 +172,7 @@ class TACInterpreter:
             self.pc += 1
 
         # ---- arithmetic ------------------------------------------------
-        elif op in ("+", "-", "*", "/", "//", "%", "**"):
+        elif op in ("+", "-", "*", "/", "//", "%", "**", "^"):
             a = self._coerce_for_arithmetic(self._val(arg1))
             b = self._coerce_for_arithmetic(self._val(arg2))
             self.memory[result] = self._arith(op, a, b)
@@ -200,23 +242,11 @@ class TACInterpreter:
         
         elif op == "SPILL":
             val = self._val(arg1)
-            # Format floats to always show 2 decimal places
-            if isinstance(val, float):
-                text = f"{val:.2f}"
-            else:
-                text = str(val)
-            if text.startswith('"') and text.endswith('"'):
-                text = text[1:-1]
+            text = self._format_spill(val, self.var_types.get(arg1))
             text = text.replace("\\\\n", "\n").replace("\\\\t", "\t").replace("\\n", "\n").replace("\\t", "\t")
             if arg2 is not None:
-                val2 = self._val(arg2)
-                if isinstance(val2, float):
-                    text2 = f"{val2:.2f}"
-                else:
-                    text2 = str(val2)
-                if text2.startswith('"') and text2.endswith('"'):
-                    text2 = text2[1:-1]
-                text += text2
+                val2  = self._val(arg2)
+                text += self._format_spill(val2, self.var_types.get(arg2))
             self._console_write(text, "#f1f6f4")
             self.pc += 1
 
@@ -247,7 +277,7 @@ class TACInterpreter:
 
             func_pc = self.functions[func_name]
 
-            # Save current state
+            # Save complete caller state BEFORE touching self.memory
             self.call_stack.append({
                 "return_pc" : self.pc + 1,
                 "memory"    : dict(self.memory),
@@ -259,6 +289,12 @@ class TACInterpreter:
             args = []
             for _ in range(num_params):
                 args.append(self.param_stack.pop(0))
+
+            # Give the callee a FRESH memory containing only global variables.
+            # This prevents the caller's local variables from leaking into the
+            # callee's scope, which is the root cause of recursion corruption.
+            self.memory = {k: v for k, v in self.memory.items()
+                           if k in self.global_vars}
 
             # Jump to function, skip FUNC_BEGIN
             self.pc = func_pc + 1
@@ -278,9 +314,10 @@ class TACInterpreter:
 
         # ---- array operations ------------------------------------------
         elif op == "[]=":
-            # arr[index] = val  →  arg1=arr_name, arg2=index, result=value
+            # arr[byte_offset] = val  →  arg1=arr_name, arg2=byte_offset, result=value
+            # byte_offset = element_index * 4; convert back to list index
             arr_name = arg1
-            index    = int(self._val(arg2))
+            index    = int(self._val(arg2)) // 4
             val      = self._val(result)
             # Apply type conversion if array has a known element type
             arr_type = self.var_types.get(arr_name)
@@ -298,17 +335,21 @@ class TACInterpreter:
             self.pc += 1
 
         elif op == "=[]":
-            # t = arr[index]  →  arg1=arr_name, arg2=index, result=temp
+            # t = arr[byte_offset]  →  arg1=arr_name, arg2=byte_offset, result=temp
+            # byte_offset = element_index * 4; convert back to list index
             arr_name = arg1
-            index    = int(self._val(arg2))
+            index    = int(self._val(arg2)) // 4
             arr      = self.memory.get(arr_name, [])
+            arr_type = self.var_types.get(arr_name, "int")
             if isinstance(arr, list) and 0 <= index < len(arr):
                 self.memory[result] = arr[index]
             else:
                 # Out of bounds — store default based on array type
-                arr_type = self.var_types.get(arr_name, "int")
                 defaults = {"int": 0, "float": 0.00, "bool": "betray", "str": " ", "char": " "}
                 self.memory[result] = defaults.get(arr_type, 0)
+            # Propagate element type to the temp so SPILL can format correctly
+            if result:
+                self.var_types[result] = arr_type
             self.pc += 1
 
         elif op == "FUNC_BEGIN":
@@ -318,14 +359,14 @@ class TACInterpreter:
             if self.call_stack:
                 frame = self.call_stack.pop()
                 ret_pc  = frame["return_pc"]
-                ret_var = frame["ret_var"]
-                # restore caller memory but keep any globals updated
                 caller_mem = frame["memory"]
-                # propagate global-like vars (I, J, K, etc.) back
-                for k, v in self.memory.items():
-                    caller_mem[k] = v
+                # Restore caller's memory, then propagate ONLY global variable
+                # changes made by the callee.  Propagating all callee vars would
+                # overwrite the caller's same-named locals in recursive calls.
+                for k in self.global_vars:
+                    if k in self.memory:
+                        caller_mem[k] = self.memory[k]
                 self.memory = caller_mem
-                # restore caller var_types
                 self.var_types = frame.get("var_types", self.var_types)
                 self.pc = ret_pc
             else:
@@ -333,20 +374,23 @@ class TACInterpreter:
 
         elif op == "closure":
             ret_value = self._val(arg1)
-            self.last_return_value = ret_value
             if self.call_stack:
                 frame = self.call_stack.pop()
                 ret_var = frame.get("ret_var")
                 caller_mem = frame["memory"]
-                for k, v in self.memory.items():
-                    caller_mem[k] = v
+                # Restore caller's memory, propagating ONLY globals back.
+                for k in self.global_vars:
+                    if k in self.memory:
+                        caller_mem[k] = self.memory[k]
                 self.memory = caller_mem
                 self.var_types = frame.get("var_types", self.var_types)
+                # Write the return value into the temp the CALL quad reserved.
                 if ret_var:
                     self.memory[ret_var] = ret_value
-                self.last_return_value = ret_value
+                self.last_return_value = ret_value if not ret_var else None
                 self.pc = frame["return_pc"]
             else:
+                self.last_return_value = ret_value
                 self.running = False
              
         else:
@@ -354,9 +398,32 @@ class TACInterpreter:
             self.pc += 1
 
     # ------------------------------------------------------------------ #
+    #  SPILL FORMATTING                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _format_spill(self, val, var_type=None):
+        """
+        Convert *val* to a printable string.
+        When *var_type* is 'char' and *val* is an integer (stored as ord),
+        convert via chr() so digits like 49 print as '1' not '49'.
+        """
+        if var_type == "char" and isinstance(val, int):
+            try:
+                return chr(val)
+            except (ValueError, OverflowError):
+                return str(val)
+        if isinstance(val, float):
+            text = f"{val:.2f}"
+        else:
+            text = str(val)
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        return text
+
+    # ------------------------------------------------------------------ #
     #  INPUT HANDLING                                                      #
     # ------------------------------------------------------------------ #
-    
+
     def _on_key(self, event):
         # Only allow printable characters
         if event.char and event.char.isprintable():
@@ -373,37 +440,129 @@ class TACInterpreter:
         return "break"
 
     def _on_enter(self, event):
+        # Always unbind FIRST — prevents double-bound handlers that cause
+        # the input system to lock up silently after the first rejection.
+        self.console.unbind("<Return>")
+        self.console.unbind("<Key>")
+        self.console.unbind("<BackSpace>")
+
         raw = self.input_buffer.strip()
 
         if not raw:
+            # Empty — re-arm and wait, no message
+            self.console.bind("<Key>",       self._on_key)
+            self.console.bind("<Return>",    self._on_enter)
+            self.console.bind("<BackSpace>", self._on_backspace)
             return "break"
 
         self._console_write("\n", "#f1f6f4")
 
-        self.console.unbind("<Return>")
-        self.console.unbind("<Key>")
-        self.console.unbind("<BackSpace>")
+        target_type = self.var_types.get(self.input_var)
+
+        # ── Helper: show red error and re-arm input ──────────────────────
+        # Safe to call because unbind already happened at the top.
+        def _reject(msg):
+            self._console_write(msg, "#ff6b6b")
+            self.input_buffer  = ""
+            self.waiting_input = True
+            self.console.bind("<Key>",       self._on_key)
+            self.console.bind("<Return>",    self._on_enter)
+            self.console.bind("<BackSpace>", self._on_backspace)
+
+        # ── int: bare integer only — no decimal point, no letters ────────
+        if target_type == "int":
+            valid = False
+            if "." not in raw:
+                try:
+                    v = int(raw)
+                    valid = True
+                except ValueError:
+                    pass
+            if not valid:
+                _reject(f"Invalid input \"{raw}\": integers only, no letters or decimals. Try again: ")
+                return "break"
+            # Range check: -999999999999 to +999999999999 (12 digits)
+            if abs(v) > 999999999999:
+                _reject(f"Invalid input \"{raw}\": integer out of range (-999999999999 to 999999999999). Try again: ")
+                return "break"
+
+        # ── float: any valid number ───────────────────────────────────────
+        elif target_type == "float":
+            try:
+                float(raw)
+            except ValueError:
+                _reject(f"Invalid input \"{raw}\": expected a number. Try again: ")
+                return "break"
+            # Range/precision check per language spec
+            stripped = raw.lstrip('-').lstrip('+')
+            if '.' in stripped:
+                int_part, frac_part = stripped.split('.', 1)
+            else:
+                int_part, frac_part = stripped, ''
+            # Integer portion must not exceed 999999999999 (12 digits in value)
+            try:
+                if int(int_part or '0') > 999999999999:
+                    _reject(f"Invalid input \"{raw}\": float integer part exceeds max (999999999999). Try again: ")
+                    return "break"
+            except ValueError:
+                pass
+            # Fractional portion: max 11 digits
+            if len(frac_part) > 11:
+                _reject(f"Invalid input \"{raw}\": float may only have up to 11 decimal digits. Try again: ")
+                return "break"
+
+        # ── bool: only trust / betray ─────────────────────────────────────
+        elif target_type == "bool":
+            if raw not in ("trust", "betray"):
+                _reject(f"Invalid input \"{raw}\": expected trust or betray. Try again: ")
+                return "break"
+
+        # ── char scalar: exactly one character ───────────────────────────
+        elif target_type == "char" and not isinstance(self.memory.get(self.input_var), list):
+            if len(raw) != 1:
+                _reject(f"Invalid input \"{raw}\": expected a single character. Try again: ")
+                return "break"
+
+        # ── Input accepted — store value ──────────────────────────────────
         self.waiting_input = False
         self.input_buffer  = ""
 
-        try:
-            value = int(raw)
-        except ValueError:
-            try:
-                value = float(raw)
-            except ValueError:
-                value = raw
-
-        self.memory[self.input_var] = value
+        # char array: store as ASCII ordinals
+        if (target_type == "char" and
+                isinstance(self.memory.get(self.input_var), list)):
+            arr = self.memory[self.input_var]
+            for i in range(len(arr)):
+                arr[i] = ord(raw[i]) if i < len(raw) else ord(" ")
+        else:
+            # For char variables, store the raw character directly.
+            # Do NOT parse through int() first — '1' must stay as '1', not become 1.
+            if target_type == "char":
+                value = raw[0]
+            else:
+                try:
+                    value = int(raw)
+                except ValueError:
+                    try:
+                        value = float(raw)
+                    except ValueError:
+                        value = raw
+                # Apply declared-type coercion for non-char types.
+                if target_type:
+                    try:
+                        value = self._convert(value, target_type, self.input_var)
+                    except RuntimeError:
+                        pass
+            self.memory[self.input_var] = value
 
         # Resume execution
-        self._run()
+        try:
+            self._run()
+        except Exception as e:
+            self._console_write(f"\nRuntime Error: {e}\n", "#ff6b6b")
+            self.running = False
+            self._console_set_editable(False)
         return "break"
     
-
-    # ------------------------------------------------------------------ #
-    #  FINISH                                                              #
-    # ------------------------------------------------------------------ #
     def _finish(self):
         self._console_write("\n✓ BUILD SUCCESSFUL!.\n", "#10a37f")
         self._console_set_editable(False)
@@ -517,15 +676,36 @@ class TACInterpreter:
     def _coerce_for_arithmetic(self, val):
         """
         Rule 8a: In arithmetic/relational expressions:
-        - bool → int  (betray=0, trust=1)
-        - char → int  (ASCII value)
+        - bool   → int    (betray=0, trust=1)
+        - char   → int    (ASCII value)
+        - float  → unchanged (must NOT be converted to int)
+        - numeric string → int or float  (global fixed declarations store raw strings)
+
+        IMPORTANT: isinstance(val, bool) must be checked before any == / in
+        comparison because Python treats 1.0 == True and 0.0 == False as True,
+        which would silently coerce floats to int 1/0.
         """
-        if val in ("trust", True):
+        # bool (Python bool or EmE string literal) → int
+        if isinstance(val, bool):
+            return 1 if val else 0
+        if val == "trust":
             return 1
-        if val in ("betray", False):
+        if val == "betray":
             return 0
+        # char → int (ASCII value)
         if isinstance(val, str) and len(val) == 1:
             return ord(val)
+        # Numeric strings (e.g. from global fixed declarations stored as raw text)
+        if isinstance(val, str):
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+        # float and int pass through unchanged
         return val
 
     def _coerce_to_bool(self, val):
@@ -594,15 +774,44 @@ class TACInterpreter:
                 return val
             if isinstance(val, bool):
                 return "trust" if val else "betray"
+            if isinstance(val, list):
+                return 0
+            # If declared type is char and value is stored as an integer (ASCII code),
+            # convert to the corresponding character so comparisons and SPILL are correct.
+            if isinstance(val, int) and self.var_types.get(x) == "char":
+                try:
+                    return chr(val)
+                except (ValueError, OverflowError):
+                    pass
             if isinstance(val, str):
-                try:
-                    return int(val)
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    return float(val)
-                except (ValueError, TypeError):
-                    pass
+                # If the stored value IS the variable name itself, the variable
+                # was never initialized — return the declared-type default
+                if val == x:
+                    declared_type = self.var_types.get(x)
+                    defaults = {"int": 0, "float": 0.0, "bool": "betray",
+                                "str": " ", "char": " "}
+                    if declared_type in defaults:
+                        return defaults[declared_type]
+                    return 0
+                declared_type = self.var_types.get(x)
+                # Char variables store a single character string — return it as-is.
+                # Do NOT parse through int() or the character '1' becomes integer 1.
+                if declared_type == "char":
+                    return val
+                if declared_type == "float":
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    try:
+                        return int(val)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
             return val
         # Bool literals
         if x == "trust":
@@ -625,19 +834,57 @@ class TACInterpreter:
         # Char literal
         if isinstance(x, str) and x.startswith("'") and x.endswith("'") and len(x) == 3:
             return x[1]
+        # Last resort: if it looks like a variable name (uppercase start),
+        # it was never stored in memory — return 0 as safe numeric default
+        if isinstance(x, str) and x and x[0].isupper():
+            declared_type = self.var_types.get(x)
+            defaults = {"int": 0, "float": 0.0, "bool": "betray",
+                        "str": " ", "char": " "}
+            if declared_type in defaults:
+                return defaults[declared_type]
+            return 0
         return x
 
     def _arith(self, op, a, b):
+        # Last-defense: convert any remaining strings or lists to numbers
+        def _to_num(x):
+            # list → use first element (should not happen but guards array misuse)
+            if isinstance(x, list):
+                x = x[0] if x else 0
+            if isinstance(x, (int, float)):
+                return x
+            if isinstance(x, str):
+                # single char → ASCII value
+                if len(x) == 1 and not x.isdigit():
+                    return ord(x)
+                try:
+                    return int(x)
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    return float(x)
+                except (ValueError, TypeError):
+                    pass
+            return x
+        a = _to_num(a)
+        b = _to_num(b)
         if op == "+":  return a + b
         if op == "-":  return a - b
         if op == "*":  return a * b
         if op == "/":
-            if isinstance(a, int) and isinstance(b, int):
-                return a // b
+            if b == 0:
+                raise RuntimeError("Division by zero")
             return a / b
-        if op == "//": return int(a) // int(b)
-        if op == "%":  return int(a) % int(b)
+        if op == "//":
+            if b == 0:
+                raise RuntimeError("Integer division by zero")
+            return int(a) // int(b)
+        if op == "%":
+            if b == 0:
+                raise RuntimeError("Modulo by zero")
+            return int(a) % int(b)
         if op == "**": return a ** b
+        if op == "^":  return a ** b
 
     def _compare(self, op, a, b):
         def to_num(x):
@@ -651,6 +898,10 @@ class TACInterpreter:
                 return float(x)
             except (ValueError, TypeError):
                 pass
+            # Single char string → ordinal so char-array elements (stored as ints)
+            # compare correctly with char literals returned by _val()
+            if isinstance(x, str) and len(x) == 1:
+                return ord(x)
             return x
         a = to_num(a)
         b = to_num(b)
