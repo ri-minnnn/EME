@@ -263,7 +263,6 @@ class TACWalker:
             ar_opt = dec.get("arOpt") or {}
             size2  = ar_opt.get("size2")
             if size2 is not None:
-                # ── 2D array ──
                 rows, cols = int(size_token), int(size2)
                 self.array_dims[name] = {"rows": rows, "cols": cols}
                 self.emit("ARRAY_DECL", name, str(rows * cols), dtype)
@@ -274,7 +273,6 @@ class TACWalker:
                     t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
                     self.emit("[]=", name, t_off, elem)
             else:
-                # ── 1D array ──
                 self.array_dims[name] = {"size": int(size_token)}
                 self.emit("ARRAY_DECL", name, str(size_token), dtype)
                 elements = self._extract_elements(ar_opt)
@@ -359,7 +357,6 @@ class TACWalker:
                 t = self.new_temp()
                 self.emit("READ", None, None, t)
                 if idx2 is not None:
-                    # 2D READ: arr[row][col] = input
                     dims  = self.array_dims.get(var_name, {})
                     tcols = str(dims.get("cols", 1))
                     t1 = self.new_temp(); self.emit("*", str(idx), tcols, t1)
@@ -367,7 +364,6 @@ class TACWalker:
                     t3 = self.new_temp(); self.emit("*", t2, "4", t3)
                     self.emit("[]=", var_name, t3, t)
                 else:
-                    # 1D READ: arr[index] = input  (index * 4)
                     t_off = self.new_temp(); self.emit("*", str(idx), "4", t_off)
                     self.emit("[]=", var_name, t_off, t)
             else:
@@ -399,7 +395,6 @@ class TACWalker:
             ar_opt = loc_dec.get("arOpt") or {}
             size2  = ar_opt.get("size2")
             if size2 is not None:
-                # ── 2D array ──
                 rows, cols = int(size_token), int(size2)
                 self.array_dims[name] = {"rows": rows, "cols": cols}
                 self.emit("ARRAY_DECL", name, str(rows * cols), dtype)
@@ -410,7 +405,6 @@ class TACWalker:
                     t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
                     self.emit("[]=", name, t_off, elem)
             else:
-                # ── 1D array ──
                 self.array_dims[name] = {"size": int(size_token)}
                 self.emit("ARRAY_DECL", name, str(size_token), dtype)
                 elements = self._extract_elements(ar_opt)
@@ -457,7 +451,6 @@ class TACWalker:
             f_array = fix_loc_dec.get("fArray") or fix_loc_dec
             size2   = f_array.get("size2") if isinstance(f_array, dict) else None
             if size2 is not None:
-                # ── 2D fixed array ──
                 rows, cols = int(size_token), int(size2)
                 self.array_dims[name] = {"rows": rows, "cols": cols}
                 self.emit("ARRAY_DECL", name, str(rows * cols), dtype)
@@ -468,7 +461,6 @@ class TACWalker:
                     t_off = self.new_temp(); self.emit("*", str(i), "4", t_off)
                     self.emit("[]=", name, t_off, elem)
             else:
-                # ── 1D fixed array ──
                 self.array_dims[name] = {"size": int(size_token)}
                 self.emit("ARRAY_DECL", name, str(size_token), dtype)
                 elements = self._extract_elements(f_array)
@@ -491,23 +483,19 @@ class TACWalker:
 
         id_type = idExpr.get("type", "")
 
-        # ── Function call: foo(...) ──────────────────────────────────────
+        # ── Function call: ───
         if id_type == "idCallExpr":
             self._walk_echo_call(var, idExpr.get("echOp"))
             return
 
-        # ── Array element statement: A[i]=…, A[i][j]=…, A[i]++, A[i][j]++ ─
+        # ── Array element statement ─
         if id_type == "idExpr" and idExpr.get("index") is not None:
             row_val = self.gen_expr_tokens(flatten_expr(idExpr.get("index")))
-
-            # Check for 2D: A[row][col]
             idx2_node = idExpr.get("index2") or {}
             idx2      = idx2_node.get("index") if isinstance(idx2_node, dict) else None
-
             arr_id_tail = idExpr.get("arrIDTail") or {}
 
             if idx2 is not None:
-                # ── Compute 2D offset: (row * total_cols + col) * 4 ──
                 col_val = str(idx2)
                 dims    = self.array_dims.get(var, {})
                 tcols   = str(dims.get("cols", 1))
@@ -515,18 +503,15 @@ class TACWalker:
                 t2 = self.new_temp(); self.emit("+", t1, col_val, t2)
                 t_offset = self.new_temp(); self.emit("*", t2, "4", t_offset)
             else:
-                # ── Compute 1D offset: index * 4 ──
                 t_offset = self.new_temp(); self.emit("*", row_val, "4", t_offset)
-
-            # Check for A[i]++ / A[i][j]++
             arr_tail_op = arr_id_tail.get("op", "")
+
             if arr_tail_op in ("++", "--"):
                 self._walk_inc_dec(arr_tail_op, var, t_offset)
                 return
-
-            # Otherwise assignment: A[i] = expr  or  A[i][j] = expr
             ass_val  = arr_id_tail.get("assVal") or {}
             rhs_node = None
+
             if ass_val.get("kind") == "STRLIT":
                 rhs_node = ass_val
             elif ass_val.get("exprDec"):
@@ -552,12 +537,12 @@ class TACWalker:
                 self.emit("[]=", var, t_offset, val)
             return
 
-        # ── Plain postfix ++/-- on variable: x++ x-- ────────────────────
+        # ── Plain postfix ++/-- on variable ────
         if id_type in ("postInc", "postDec"):
             self._walk_inc_dec("++" if id_type == "postInc" else "--", var)
             return
 
-        # ── Plain variable assignment / compound assignment ──────────────
+        # ── Plain variable assignment / compound assignment ───
         op          = idExpr.get("op", "=")
         arr_id_tail = idExpr.get("arrIDTail") or {}
         arr_tail_op = arr_id_tail.get("op", "")
@@ -584,21 +569,13 @@ class TACWalker:
             self.emit("=", self.gen_expr(rhs_node), None, var)
 
     def _walk_inc_dec(self, op, var, index=None):
-        """
-        Increment or decrement a plain variable or an array element.
-          op    : "++" or "--"
-          var   : variable name  (or array name when index is given)
-          index : array index string/temp — None for plain variables
-        """
         t = self.new_temp()
         if index is not None:
-            # Array element:  A[index]++  →  t_read = A[index]; t = t_read ± 1; A[index] = t
             t_read = self.new_temp()
             self.emit("=[]", var, str(index), t_read)
             self.emit("+" if op == "++" else "-", t_read, "1", t)
             self.emit("[]=", var, str(index), t)
         else:
-            # Plain variable:  x++  →  t = x ± 1; x = t
             self.emit("+" if op == "++" else "-", var, "1", t)
             self.emit("=", t, None, var)
 
@@ -607,22 +584,18 @@ class TACWalker:
         for arg in spill_opt.get("args", []):
             kind = arg.get("kind", "")
             if kind == "STRLIT":
-                # String literal argument: spill("hello")
                 val = arg.get("value")
                 if val:
                     self.emit("SPILL", val, None, None)
             elif kind == "ID":
                 name = arg.get("name")
                 if name:
-                    # Check for array subscript: spill(A[i]) or spill(A[i][j])
                     una_op = arg.get("unaOp") or {}
                     index  = una_op.get("index")
                     if index is not None:
-                        # Check for 2D via eleIndex inside unaOp
                         ele_idx  = una_op.get("eleIndex") or {}
                         index2   = ele_idx.get("index") if isinstance(ele_idx, dict) else None
                         if index2 is not None:
-                            # 2D: spill(A[row][col])
                             dims  = self.array_dims.get(name, {})
                             tcols = str(dims.get("cols", 1))
                             t1 = self.new_temp(); self.emit("*", str(index), tcols, t1)
@@ -630,12 +603,10 @@ class TACWalker:
                             t3 = self.new_temp(); self.emit("*", t2, "4", t3)
                             t  = self.new_temp(); self.emit("=[]", name, t3, t)
                         else:
-                            # 1D: spill(A[i])  → offset = i * 4
                             t_off = self.new_temp(); self.emit("*", str(index), "4", t_off)
                             t     = self.new_temp(); self.emit("=[]", name, t_off, t)
                         self.emit("SPILL", t, None, None)
                     else:
-                        # Plain variable: spill(x)
                         self.emit("SPILL", name, None, None)
             else:
                 tokens = [t for t in flatten_expr(arg)
@@ -662,8 +633,6 @@ class TACWalker:
         end_lbl     = self.new_label()
         self.emit("IF_FALSE", cond, None, else_lbl)
         self.push_scope()
-        # Body key varies by context: "stmt" at top level, "loopStmt" inside
-        # while/do-while, "coreStmt" inside core/switch — check all three.
         body = node.get("stmt") or node.get("loopStmt") or node.get("coreStmt")
         if body:
             self.walk(body)
@@ -688,7 +657,6 @@ class TACWalker:
             inner_end   = self.new_label()
             self.emit("IF_FALSE", cond, None, inner_else)
         self.push_scope()
-        # Same multi-key body lookup as walk_hope
         body = node.get("stmt") or node.get("loopStmt") or node.get("coreStmt")
         if body:
             self.walk(body)
@@ -754,7 +722,6 @@ class TACWalker:
         dup           = node.get("dup")
         loop_var_name = din.get("name", "")
         din_kind      = din.get("kind", "")
-        # new decl uses dinTail; existing var uses dinTail1
         if din_kind == "decl":
             init_node = (din.get("dinTail") or {}).get("value")
         else:
@@ -848,9 +815,6 @@ class TACWalker:
         if node.get("loopStmt"):
             self.walk(node["loopStmt"])
         self.emit_label(continue_lbl)
-        # pop_scope BEFORE the condition check so the scope is balanced on
-        # every path — both the back-edge (IF_TRUE jumps to start_lbl which
-        # immediately does push_scope again) and the fall-through exit path.
         self.pop_scope()
         cond_tokens = [t for t in flatten_expr(node.get("condition")) if t != ";"]
         self.emit("IF_TRUE", self.gen_expr_tokens(cond_tokens), None, start_lbl)
