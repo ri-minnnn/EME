@@ -547,12 +547,12 @@ class TACWalker:
         arr_id_tail = idExpr.get("arrIDTail") or {}
         arr_tail_op = arr_id_tail.get("op", "")
 
-        # Catch plain x++ / x-- via arrIDTail op
+        # Catch plain x++ / x-- 
         if arr_tail_op in ("++", "--"):
             self._walk_inc_dec(arr_tail_op, var)
             return
 
-        # Compound assignment: x += expr, x -= expr, etc.
+        # Compound assignment
         _COMP_OP = {"+=": "+", "-=": "-", "*=": "*", "/=": "/", "//=": "//", "%=": "%", "^=": "^"}
         if op in _COMP_OP:
             rhs_node = idExpr.get("exprDec")
@@ -562,7 +562,7 @@ class TACWalker:
                 self.emit("=", t, None, var)
             return
 
-        # Simple assignment: x = expr
+        # Simple assignment
         ass_val  = arr_id_tail.get("assVal") or {}
         rhs_node = ass_val if ass_val.get("kind") == "STRLIT" else ass_val.get("exprDec")
         if rhs_node:
