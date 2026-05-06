@@ -331,7 +331,7 @@ class TACInterpreter:
 
                 if ret_var:
                     self.memory[ret_var] = ret_value
-                self.last_return_value = ret_value if not ret_var else None
+                self.last_return_value = None
                 self.pc = frame["return_pc"]
             else:
                 self.last_return_value = ret_value
@@ -469,7 +469,11 @@ class TACInterpreter:
         return "break"
     
     def _finish(self):
-        self._console_write("\n✓ BUILD SUCCESSFUL!.\n", "#10a37f")
+        ret = self.last_return_value
+        if ret is not None and ret != 0:
+            self._console_write("\nCode exited with Errors.\n", "#575656")
+        else:
+            self._console_write("\n✓ BUILD SUCCESSFUL!.\n", "#10a37f")
         self._console_set_editable(False)
 
  # ----- TYPE CONVERSION -----
@@ -559,7 +563,7 @@ class TACInterpreter:
             return "int"
         if isinstance(val, float):
             return "float"
-        if isinstance(val, str) and len(val) == 1 and not val.isdigit():
+        if isinstance(val, str) and len(val) == 1:
             return "char"
         return "str"
 

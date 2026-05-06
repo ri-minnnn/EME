@@ -1241,14 +1241,7 @@ class EmeCompilerLogic:
             self.update_button_states(True, True, False)
             return
 
-        # ── Phase 4: TAC ──────────────────────────────────────────────────────
-        # All phases passed — land on TAC view
-        self.current_mode = "TAC"
-        self._apply_mode_ui("TAC")
-        if self.analysis_output_frame:
-            for widget in self.analysis_output_frame.winfo_children():
-                widget.destroy()
-
+        # ── Phase 4: Run ──────────────────────────────────────────────────────
         if self.console_errors and self.console_errors.get("1.0", tk.END).strip() == "":
             self.log_colored_message(self.console_errors, "No semantic errors.", "#ff6b6b")
         self.update_button_states(True, True, True)
@@ -1267,8 +1260,6 @@ class EmeCompilerLogic:
             if self.console_errors and self.console_warnings:
                 self.console_errors.master.master.pack_forget()
             self.console_output.pack(fill='both', expand=True, pady=(0, 5), padx=5)
-
-            self._display_tac(walker.gen.quads)
 
             self.console_output.config(state="normal")
             self.console_output.focus_force()

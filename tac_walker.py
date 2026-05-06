@@ -213,7 +213,7 @@ class TACWalker:
         self.scope_stack[-1][name] = value
 
     def gen_expr(self, node):
-        return self.gen_expr(flatten_expr(node))
+        return self.gen_expr_tokens(flatten_expr(node))
 
     def gen_expr_tokens(self, tokens):
         return self.gen.gen_expr(tokens)
@@ -355,6 +355,9 @@ class TACWalker:
                 idx2_node = ele_index.get("index2") or {}
                 idx2      = idx2_node.get("index") if isinstance(idx2_node, dict) else None
                 t = self.new_temp()
+                arr_type = self.var_types.get(var_name)
+                if arr_type:
+                    self.emit("DECLARE", t, arr_type, None)
                 self.emit("READ", None, None, t)
                 if idx2 is not None:
                     dims  = self.array_dims.get(var_name, {})
@@ -372,9 +375,7 @@ class TACWalker:
             self._walk_spill(node)
         elif kind == "echo":
             fname = node.get("name", "")
-            t = self._walk_echo_call(fname, node.get("echOp"))
-            if self.func_table.get(fname) != "void":
-                self.emit("SPILL", t, None, None)
+            self._walk_echo_call(fname, node.get("echOp"))
         elif kind == "desire":
             self._walk_desire(node)
         elif kind == "while":
@@ -590,11 +591,12 @@ class TACWalker:
             elif kind == "ID":
                 name = arg.get("name")
                 if name:
-                    una_op = arg.get("unaOp") or {}
-                    index  = una_op.get("index")
+                    una_op  = arg.get("unaOp") or {}
+                    ele_idx = una_op.get("eleIndex") or {}
+                    index   = ele_idx.get("index") if isinstance(ele_idx, dict) else None
                     if index is not None:
-                        ele_idx  = una_op.get("eleIndex") or {}
-                        index2   = ele_idx.get("index") if isinstance(ele_idx, dict) else None
+                        idx2_node = ele_idx.get("index2") or {}
+                        index2    = idx2_node.get("index") if isinstance(idx2_node, dict) else None
                         if index2 is not None:
                             dims  = self.array_dims.get(name, {})
                             tcols = str(dims.get("cols", 1))

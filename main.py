@@ -52,8 +52,6 @@ def create_ui():
                                   lambda: compiler_logic.switch_mode("SYNTAX"))
     btn_semantic = make_mode_button(toolbar, "Semantic", "#2b7fff", "😌",
                                     lambda: compiler_logic.switch_mode("SEMANTIC"))
-    btn_tac = make_mode_button(toolbar, "TAC", "#10a37f", "⚙",
-                               lambda: compiler_logic.switch_mode("TAC"))
     btn_run = make_mode_button(toolbar, "Run", "#e67e22", "▶",
                                lambda: compiler_logic.run_all())
 
@@ -140,6 +138,53 @@ def create_ui():
 
     code_input.bind("<Tab>", insert_tab)
     code_input.bind("<Return>", auto_indent)
+
+    # --- Auto-pairing for ( and { ---
+    def on_open_paren(event):
+        sel = code_input.tag_ranges("sel")
+        if sel:
+            selected = code_input.get(sel[0], sel[1])
+            code_input.delete(sel[0], sel[1])
+            code_input.insert("insert", "(" + selected + ")")
+        else:
+            code_input.insert("insert", "()")
+            code_input.mark_set("insert", "insert -1c")
+        return "break"
+
+    def on_open_brace(event):
+        sel = code_input.tag_ranges("sel")
+        if sel:
+            selected = code_input.get(sel[0], sel[1])
+            code_input.delete(sel[0], sel[1])
+            code_input.insert("insert", "{" + selected + "}")
+        else:
+            code_input.insert("insert", "{}")
+            code_input.mark_set("insert", "insert -1c")
+        return "break"
+
+    def on_close_paren(event):
+        if code_input.get("insert", "insert +1c") == ")":
+            code_input.mark_set("insert", "insert +1c")
+            return "break"
+
+    def on_close_brace(event):
+        if code_input.get("insert", "insert +1c") == "}":
+            code_input.mark_set("insert", "insert +1c")
+            return "break"
+
+    def on_backspace(event):
+        _PAIRS = {"(": ")", "{": "}"}
+        prev_char = code_input.get("insert -1c", "insert")
+        next_char = code_input.get("insert", "insert +1c")
+        if prev_char in _PAIRS and next_char == _PAIRS[prev_char]:
+            code_input.delete("insert -1c", "insert +1c")
+            return "break"
+
+    code_input.bind("(", on_open_paren)
+    code_input.bind("{", on_open_brace)
+    code_input.bind(")", on_close_paren)
+    code_input.bind("}", on_close_brace)
+    code_input.bind("<BackSpace>", on_backspace)
 
     # Synchronized Scrolling
     def sync_scroll(*args):
@@ -331,22 +376,13 @@ def create_ui():
         compiler_logic.switch_mode("SEMANTIC")
         _hide_tac_panel()
 
-    def _on_tac():
-        compiler_logic.switch_mode("TAC")
-        _show_tac_panel()
-
     def _on_run():
         compiler_logic.run_all()
-        # Show panel only if run_all landed on a mode that needs it
-        if compiler_logic.current_mode in ("LEXICAL", "TAC"):
-            _show_tac_panel()
-        else:
-            _hide_tac_panel()
+        _hide_tac_panel()
 
     btn_lexical.config(command=_wrap(btn_lexical, _on_lexical))
     btn_syntax.config(command=_wrap(btn_syntax,   _on_syntax))
     btn_semantic.config(command=_wrap(btn_semantic, _on_semantic))
-    btn_tac.config(command=_wrap(btn_tac, _on_tac))
     btn_run.config(command=_wrap(btn_run, _on_run))
 
     # --- Bind UI components to logic ---
@@ -361,7 +397,7 @@ def create_ui():
         console_warnings=console_warnings
     )
 
-    compiler_logic.set_buttons(btn_lexical, btn_syntax, btn_semantic, btn_tac, btn_run)
+    compiler_logic.set_buttons(btn_lexical, btn_syntax, btn_semantic, run=btn_run)
 
     # Added 02/10/2026: Set root window reference for file dialogs
     compiler_logic.set_root_window(root)
